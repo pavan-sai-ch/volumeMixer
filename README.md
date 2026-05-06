@@ -70,10 +70,5 @@ Contributions are welcome! If you have ideas for features (like audio presets or
 
 ---
 
-## 📄 License
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
 ### Created by Pavan
 *Built with the help of AI coding agents and a passion for better macOS workflows.*
