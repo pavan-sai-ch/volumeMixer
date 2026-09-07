@@ -2,33 +2,36 @@
 //  AudioProcess.swift
 //  volumeMixer
 //
-//  Model for a single process that is producing audio output.
+//  One row in the mixer: a user-facing app, plus every Core Audio process
+//  object currently producing audio on its behalf.
 //
 
 import AppKit
 import CoreAudio
 
-/// One audio-producing process, as seen by Core Audio.
 struct AudioProcess: Identifiable, Hashable {
-    /// Core Audio process object ID — the handle a tap is built from.
-    let id: AudioObjectID
-    let pid: pid_t
-    let bundleID: String?
+    /// Bundle ID of the owning app — stable across relaunch and across the
+    /// helper processes it spawns, so it is both the row identity and the
+    /// key levels are remembered under.
+    let id: String
     let name: String
     let icon: NSImage?
+    let pid: pid_t
 
-    init(id: AudioObjectID, pid: pid_t, bundleID: String?) {
-        self.id = id
-        self.pid = pid
-        self.bundleID = bundleID
+    /// Every audible Core Audio process object belonging to this app. A
+    /// browser with two noisy tabs contributes more than one.
+    let objectIDs: [AudioObjectID]
 
-        let running = pid > 0 ? NSRunningApplication(processIdentifier: pid) : nil
-        self.name = running?.localizedName
-            ?? bundleID?.components(separatedBy: ".").last
-            ?? "PID \(pid)"
-        self.icon = running?.icon
+    init(app: NSRunningApplication, objectIDs: [AudioObjectID]) {
+        self.id = app.bundleIdentifier ?? "pid:\(app.processIdentifier)"
+        self.name = app.localizedName ?? app.bundleIdentifier ?? "PID \(app.processIdentifier)"
+        self.icon = app.icon
+        self.pid = app.processIdentifier
+        self.objectIDs = objectIDs
     }
 
-    static func == (lhs: AudioProcess, rhs: AudioProcess) -> Bool { lhs.id == rhs.id }
+    static func == (lhs: AudioProcess, rhs: AudioProcess) -> Bool {
+        lhs.id == rhs.id && lhs.objectIDs == rhs.objectIDs
+    }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }

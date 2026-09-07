@@ -4,9 +4,9 @@
 //
 //  Per-process gain via Core Audio taps.
 //
-//  How this achieves per-app volume: a tap created with `.mutedWhenTapped`
-//  stops the process's audio from reaching the hardware for as long as we are
-//  reading the tap. We then re-render those same samples ourselves, scaled by
+//  How this achieves per-app volume: a tap created with `.muted` stops the
+//  process's audio from reaching the hardware entirely. We then re-render
+//  those same samples ourselves, scaled by
 //  `gain`, through a private aggregate device wrapping the default output.
 //  Net effect: that one app plays at our chosen level, everything else is
 //  untouched. At gain 1.0 the path is a straight copy.
@@ -31,19 +31,33 @@ final class ProcessTap {
     /// class state, locks, or the main actor. Written from the UI thread.
     private let gainPointer: UnsafeMutablePointer<Float>
 
+    /// [0] = peak input amplitude seen, [1] = render callback count.
+    /// Lets the main thread tell "tap is delivering audio" from "tap is
+    /// delivering digital silence", which are indistinguishable by status code.
+    private let statsPointer: UnsafeMutablePointer<Float>
+
     private(set) var errorMessage: String?
 
     init(process: AudioProcess, gain: Float = 1.0) {
         self.process = process
         self.gainPointer = .allocate(capacity: 1)
         self.gainPointer.initialize(to: gain)
+        self.statsPointer = .allocate(capacity: 2)
+        self.statsPointer.initialize(repeating: 0, count: 2)
     }
 
     deinit {
         invalidate()
         gainPointer.deinitialize(count: 1)
         gainPointer.deallocate()
+        statsPointer.deinitialize(count: 2)
+        statsPointer.deallocate()
     }
+
+    /// Peak input amplitude observed by the render callback since activation.
+    var inputPeak: Float { statsPointer[0] }
+    /// Number of render callbacks served since activation.
+    var callbackCount: Int { Int(statsPointer[1]) }
 
     var gain: Float {
         get { gainPointer.pointee }
@@ -53,12 +67,19 @@ final class ProcessTap {
     // MARK: - Lifecycle
 
     func activate() {
-        guard tapID == kAudioObjectUnknown else { return }
+        guard tapID == kAudioObjectUnknown, !process.objectIDs.isEmpty else { return }
 
-        let description = CATapDescription(stereoMixdownOfProcesses: [process.id])
-        description.name = "volumeMixer-\(process.pid)"
+        // One tap covering every audible process the app owns, so a browser
+        // with several noisy tabs is controlled by a single slider.
+        let description = CATapDescription(stereoMixdownOfProcesses: process.objectIDs)
+        description.name = "volumeMixer-\(process.id)"
         description.isPrivate = true
-        description.muteBehavior = .mutedWhenTapped
+        // `.mutedWhenTapped` mutes only while the tap is "read by another audio
+        // client" — a private tap read by this same process never satisfies
+        // that, so the app kept playing at full volume alongside our relay.
+        // `.muted` suppresses the process's own output unconditionally, which
+        // is what we want since we always relay.
+        description.muteBehavior = .muted
         let tapUUID = description.uuid.uuidString
 
         var status = AudioHardwareCreateProcessTap(description, &tapID)
@@ -96,9 +117,10 @@ final class ProcessTap {
         }
 
         let gain = gainPointer
+        let stats = statsPointer
         status = AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregateID, nil) {
             _, inInputData, _, outOutputData, _ in
-            ProcessTap.render(input: inInputData, output: outOutputData, gain: gain.pointee)
+            ProcessTap.render(input: inInputData, output: outOutputData, gain: gain.pointee, stats: stats)
         }
         guard status == noErr, ioProcID != nil else {
             fail("AudioDeviceCreateIOProcIDWithBlock failed", status)
@@ -139,8 +161,10 @@ final class ProcessTap {
     private static func render(
         input: UnsafePointer<AudioBufferList>,
         output: UnsafeMutablePointer<AudioBufferList>,
-        gain: Float
+        gain: Float,
+        stats: UnsafeMutablePointer<Float>
     ) {
+        stats[1] += 1
         let inList = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
         let outList = UnsafeMutableAudioBufferListPointer(output)
 
@@ -155,6 +179,12 @@ final class ProcessTap {
             }
 
             let byteCount = min(inList[index].mDataByteSize, outBuffer.mDataByteSize)
+
+            var peak: Float = 0
+            vDSP_maxmgv(source.assumingMemoryBound(to: Float.self), 1, &peak,
+                        vDSP_Length(Int(byteCount) / MemoryLayout<Float>.size))
+            if peak > stats[0] { stats[0] = peak }
+
             if gain == 1.0 {
                 memcpy(destination, source, Int(byteCount))
             } else {

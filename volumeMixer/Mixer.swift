@@ -16,11 +16,14 @@ private let log = Logger(subsystem: "app.pavanchilukala.volumeMixer", category: 
 @MainActor
 @Observable
 final class Mixer {
+    /// Single instance shared by the scene and the app delegate.
+    static let shared = Mixer()
+
     let controller = AudioProcessController()
 
     /// Levels are keyed by bundle ID, not PID, so a relaunched app keeps its level.
     private var levels: [String: Float]
-    @ObservationIgnored private var taps: [AudioObjectID: ProcessTap] = [:]
+    @ObservationIgnored private var taps: [String: ProcessTap] = [:]
 
     private static let levelsKey = "processLevels"
 
@@ -36,14 +39,8 @@ final class Mixer {
 
     var processes: [AudioProcess] { controller.processes }
 
-    /// Bundle ID when there is one so levels survive relaunch; PID otherwise,
-    /// which still lets command-line audio sources be controlled this session.
-    private func key(for process: AudioProcess) -> String {
-        process.bundleID ?? "pid:\(process.pid)"
-    }
-
     func level(for process: AudioProcess) -> Float {
-        levels[key(for: process)] ?? 1.0
+        levels[process.id] ?? 1.0
     }
 
     /// Any error surfaced by the tap backing this process, for display in the UI.
@@ -53,7 +50,7 @@ final class Mixer {
 
     func setLevel(_ value: Float, for process: AudioProcess) {
         let clamped = max(0, min(value, 1.0))
-        levels[key(for: process)] = clamped
+        levels[process.id] = clamped
         UserDefaults.standard.set(levels.mapValues { Double($0) }, forKey: Self.levelsKey)
 
         // A tap is only worth its cost while the app is actually attenuated.
@@ -72,8 +69,28 @@ final class Mixer {
             let tap = ProcessTap(process: process, gain: clamped)
             tap.activate()
             taps[process.id] = tap
+            verifyAudioFlowing(for: process)
         }
     }
+
+    /// A muted tap that delivers no samples would leave the app completely
+    /// silent — worse than not attenuating at all. If the render callback is
+    /// running but every sample is zero, give the app its audio back.
+    private func verifyAudioFlowing(for process: AudioProcess) {
+        let id = process.id
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, let tap = self.taps[id] else { return }
+            guard tap.callbackCount > 0, tap.inputPeak == 0 else { return }
+            log.error("tap for \(id, privacy: .public) delivered only silence; restoring direct output")
+            tap.invalidate()
+            self.taps.removeValue(forKey: id)
+            self.levels[id] = 1.0
+            self.silentTaps.insert(id)
+        }
+    }
+
+    /// Apps where attenuation had to be abandoned because the tap was silent.
+    private(set) var silentTaps: Set<String> = []
 
     /// Drop taps for processes that have stopped producing audio or exited.
     func pruneStaleTaps() {
@@ -87,6 +104,29 @@ final class Mixer {
     func reset(_ process: AudioProcess) {
         setLevel(1.0, for: process)
     }
+
+    /// Diagnostic: attenuate the given PID and report what the tap delivers.
+    /// Driven by VOLUMEMIXER_SELFTEST_PID so the audio path can be exercised
+    /// without a human dragging a slider.
+    func debugSelfTest(pid: pid_t) {
+        refreshNow()
+        FileHandle.standardError.write("SELFTEST: visible=\(controller.processes.map { "\($0.pid):\($0.name)" })\n".data(using:.utf8)!)
+        guard let target = controller.processes.first(where: { $0.pid == pid }) else {
+            log.error("selftest: pid \(pid) is not producing audio")
+            return
+        }
+        setLevel(0.25, for: target)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self, let tap = self.taps[target.id] else {
+                log.error("selftest: no tap present after setLevel")
+                return
+            }
+            let msg = "SELFTEST RESULT callbacks=\(tap.callbackCount) inputPeak=\(tap.inputPeak) error=\(tap.errorMessage ?? "nil")\n"
+            FileHandle.standardError.write(msg.data(using:.utf8)!)
+        }
+    }
+
+    func refreshNow() { controller.refresh() }
 
     func shutdown() {
         controller.stop()

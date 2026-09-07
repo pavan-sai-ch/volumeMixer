@@ -5,6 +5,7 @@
 //  Enumerates processes that are currently sending audio to the output device.
 //
 
+import AppKit
 import CoreAudio
 import Observation
 
@@ -33,19 +34,25 @@ final class AudioProcessController {
     }
 
     func refresh() {
-        let objects = Self.processObjectIDs()
-        var found: [AudioProcess] = []
+        var byApp: [pid_t: (app: NSRunningApplication, objects: [AudioObjectID])] = [:]
 
-        for object in objects {
+        for object in Self.processObjectIDs() {
             // Only processes actively rendering output are worth a slider.
             guard Self.uint32(object, kAudioProcessPropertyIsRunningOutput) == 1 else { continue }
             let pid = pid_t(Self.int32(object, kAudioProcessPropertyPID) ?? -1)
-            let bundleID = Self.string(object, kAudioProcessPropertyBundleID)
-            // coreaudiod itself and our own re-render show up as output; skip them.
-            if bundleID == Bundle.main.bundleIdentifier { continue }
-            found.append(AudioProcess(id: object, pid: pid, bundleID: bundleID))
+            guard pid > 0 else { continue }
+
+            // Resolve to the owning app. This both labels browser helpers with
+            // the browser's name and drops system audio daemons, which own no
+            // user-facing app and are not something anyone wants a slider for.
+            guard let app = ResponsibleApp.resolve(pid: pid) else { continue }
+            guard app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { continue }
+            guard app.bundleIdentifier != Bundle.main.bundleIdentifier else { continue }
+
+            byApp[app.processIdentifier, default: (app, [])].objects.append(object)
         }
 
+        let found = byApp.values.map { AudioProcess(app: $0.app, objectIDs: $0.objects.sorted()) }
         let sorted = found.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         if sorted != processes { processes = sorted }
         onRefresh?()
