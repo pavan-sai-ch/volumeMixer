@@ -9,9 +9,17 @@ import SwiftUI
 
 @main
 struct volumeMixerApp: App {
+    @State private var mixer = Mixer()
+
     var body: some Scene {
-        WindowGroup {
-            ContentView()
+        MenuBarExtra {
+            MenuBarView(mixer: mixer)
+                .task {
+                    mixer.start()
+                }
+        } label: {
+            Image(systemName: "slider.vertical.3")
         }
+        .menuBarExtraStyle(.window)
     }
 }
