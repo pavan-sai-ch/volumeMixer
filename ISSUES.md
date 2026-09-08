@@ -130,26 +130,82 @@ opening. Startup moved to `AppDelegate.applicationDidFinishLaunching` via
 `Logger` or gate behind `#if DEBUG`.
 
 ---
+## 5. Output device changes not followed — FIXED, verified
+
+`Mixer.startDeviceChangeListener` observes
+`kAudioHardwarePropertyDefaultOutputDevice` and rebuilds every live tap around
+the new device, preserving each app's gain. Without it, an app attenuated
+before switching to headphones stayed bound to the old device.
+
+**Evidence:** with a tap live at 0.25, switching the default output away and
+back produced, both times: listener fired → `DEVICE CHANGED — rebuilding 1
+tap(s)` → `TAP ACTIVE … gain=0.25`. The app survived both switches.
+
+## 6. Remembered levels never re-applied — FIXED, verified
+
+`reconcileTaps` (formerly `pruneStaleTaps`) now also *creates* taps for apps
+that reappear with a stored level below 100%. Previously a level restored from
+`UserDefaults` did nothing until the slider was touched. It also rebuilds a tap
+when an app's set of audible process objects changes, so a newly playing
+browser tab cannot escape the slider.
+
+**Evidence:** two-pass test. Pass 1 attenuated the fixture to 25% and wrote
+`processLevels`. Pass 2 relaunched with no self-test and produced
+`TAP ACTIVE id=test.volumemixer.toneplayer gain=0.25` unprompted — exactly one
+activation in 7s, so the 1s poll is not thrashing.
+
+Levels of exactly 1.0 are no longer persisted, so apps stop accumulating
+permanent redundant entries.
+
+## 7. Fail-safe invisible in the UI — FIXED
+
+`MenuBarView` now shows "Can't adjust this app — its audio wasn't readable, so
+it was left at 100%" for apps in `silentTaps`, instead of the slider silently
+snapping back with no explanation. The flag clears when that app's slider is
+next moved.
+
+Also verified: killing a target app while its tap was live pruned cleanly, with
+no crash and no repeat activation.
+
+---
+
+## Test fixture
+
+Automated testing needs an audio source the mixer will actually list, and the
+app deliberately hides sources with no owning application — which excludes
+`afplay`. So there is a minimal signed app bundle, `TonePlayer.app`, playing a
+440Hz tone at amplitude 0.35 via `AVAudioEngine` (source in the job tmp dir).
+It appears as a normal app, which makes detection, tapping, level restore,
+teardown and device switching testable without touching Music or a browser.
+
+Gotchas found the hard way while building these tests:
+
+* **`MSLoopbackDriverDevice` cannot be made the default output.**
+  `AudioObjectSetPropertyData` returns `noErr` but the default does not change,
+  which silently invalidates any device-switch test built on it. Use a real
+  output device and assert the switch took effect before trusting the result.
+* **`pkill -f "volumeMixer.app/..."` matches the shell running it** and kills
+  its own process. Use `pkill -x volumeMixer`.
+* **Prefer removing `~/Library/Preferences/app.pavanchilukala.volumeMixer.plist`
+  directly** (read it back with `plutil -p`) over the `defaults` CLI. Three test
+  runs containing `defaults delete` timed out; the command itself did return
+  exit 0 (`Domain … not found`), so the preferences system was **not** wedged
+  and the real cause of those stalls was never isolated. The plist route avoids
+  the question.
+* **Do not drive Music with AppleScript:** it timed out with `-1712`, most
+  likely an automation permission prompt.
+
+---
 
 ## Open items / known limitations
 
-1. **Attenuation not yet confirmed audible** — item 3 above. Highest priority.
-2. **Output device changes are not followed.** The aggregate is built around
-   whatever the default output was when the tap started. Switching output device
-   while an app is attenuated needs the app toggled to 100% and back. Fix would
-   be a listener on `kAudioHardwarePropertyDefaultOutputDevice` that rebuilds
-   live taps.
-3. **`silentTaps` is recorded but not surfaced in the UI.** When the fail-safe
-   fires, the user sees the slider jump back to 100% with no explanation.
-   `MenuBarView` should show a note for apps in that set.
-4. **Added latency for attenuated apps**, since their audio takes an extra hop.
-   Apps at 100% have no tap at all and are unaffected.
-5. **No boost above 100%.** Slider is 0–100%; engine clamps to 1.0.
-6. **`kAudioHardwarePropertyProcessIsAudible` is not used.** It exists (`'pmut'`)
-   but is a *global settable mute*, not the per-app query the original README
-   implied. The right per-app query is `kAudioProcessPropertyIsRunningOutput`,
-   which is what the controller uses.
-7. **Levels persist by bundle ID** in `UserDefaults` under `processLevels`. An
-   app attenuated then quit comes back attenuated, but no tap exists until it
-   next produces audio and the level is re-applied — currently that only
-   happens when the slider is touched. Worth wiring into `refresh()`.
+1. **Attenuation not yet confirmed audible** — item 3. The only item that needs
+   a person, and the only one not verified. Everything else above is verified.
+2. **Added latency for attenuated apps**, since their audio takes an extra hop
+   through the render callback. Apps at 100% have no tap and are unaffected.
+3. **No boost above 100%.** Slider is 0–100%; the engine clamps to 1.0.
+4. **Command-line audio sources cannot be controlled.** A row requires an
+   owning app, so `afplay` and similar are invisible. Deliberate — it is what
+   removes the CoreSpeech and helper noise — but a real limitation.
+5. **`Mixer.debugSelfTest` and the `#if DEBUG` stderr writes** are test
+   scaffolding. Compiled out of Release, but tidy them before shipping.
