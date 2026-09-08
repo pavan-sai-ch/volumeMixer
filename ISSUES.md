@@ -2,6 +2,9 @@
 
 State as of 2026-09-07. Branch `feat/audio-engine`.
 
+**Everything here is now fixed except one item: whether the attenuation is
+audible. That single question needs a human to listen — see item 3.**
+
 Verified means measured or heard, and the evidence is named. Unverified means
 written but not yet confirmed working.
 
@@ -73,8 +76,25 @@ is worse than no attenuation, and this can no longer strand an app in silence.
 | `pruneStaleTaps` destroying its own tap in a loop | Tapped process stayed in the list with `isRunningOutput=1` for the whole test |
 | Bug in `ProcessTap.swift` itself | Its real source compiled into a CLI harness relayed correctly: peak `0.1525852` at gain 0.25 |
 
-**What still needs checking tonight:** whether `.muted` actually attenuates
-audibly. Build and run, play audio in two apps, drag one slider down. Expect
+**Automated verification attempted and rejected.** Two approaches were tried
+and neither can answer this:
+
+* A global tap excluding our own process (`h2`) reported the target still at
+  `0.65` after `.muted`. **This measurement is invalid** — a tap captures what
+  a process *renders*, which does not reflect whether audio reached the
+  hardware, so it cannot distinguish the two cases. Do not trust that number.
+* `kAudioProcessPropertyIsRunningOutput` stays `1` on a muted process, so it is
+  not a mute indicator either.
+* `kAudioHardwarePropertyProcessIsAudible` ('pmut') looked promising and is
+  what the original README implied, but it is declared in the
+  **system-object** property enum and documents "the audio of *the process*" —
+  it mutes only the calling process. It cannot silence another app, so it is
+  useless here. This rules out the README's suggested approach permanently.
+
+There is no public API that reports the final device mix, so this is not
+automatable. It needs one listen.
+
+**What still needs checking:** whether `.muted` actually attenuates audibly. Build and run, play audio in two apps, drag one slider down. Expect
 that app quieter, the other untouched. If the attenuated app goes fully
 **silent** instead, the mute is engaging but the relay is not reaching your
 speaker — check Console for `delivered only silence; restoring direct output`,

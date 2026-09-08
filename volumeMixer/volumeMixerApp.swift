@@ -12,7 +12,9 @@ import SwiftUI
 /// until the first click and the list would be empty for a second after it.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        #if DEBUG
         FileHandle.standardError.write("DELEGATE: applicationDidFinishLaunching\n".data(using:.utf8)!)
+        #endif
         MainActor.assumeIsolated {
             let mixer = Mixer.shared
             mixer.start()

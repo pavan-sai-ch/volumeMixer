@@ -24,6 +24,7 @@ final class Mixer {
     /// Levels are keyed by bundle ID, not PID, so a relaunched app keeps its level.
     private var levels: [String: Float]
     @ObservationIgnored private var taps: [String: ProcessTap] = [:]
+    @ObservationIgnored private var deviceListener: AudioObjectPropertyListenerBlock?
 
     private static let levelsKey = "processLevels"
 
@@ -33,8 +34,45 @@ final class Mixer {
     }
 
     func start() {
-        controller.onRefresh = { [weak self] in self?.pruneStaleTaps() }
+        controller.onRefresh = { [weak self] in self?.reconcileTaps() }
         controller.start()
+        startDeviceChangeListener()
+    }
+
+    /// Rebuild every live tap around the new default output device. The
+    /// aggregate device is bound to whichever output existed when the tap was
+    /// created, so without this an attenuated app stays silent after the user
+    /// switches to headphones.
+    private func startDeviceChangeListener() {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            Task { @MainActor in self?.rebuildActiveTaps() }
+        }
+        deviceListener = block
+        let status = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &address, DispatchQueue.main, block)
+        if status != noErr {
+            log.error("could not observe default output device: \(status)")
+        }
+    }
+
+    private func rebuildActiveTaps() {
+        guard !taps.isEmpty else { return }
+        log.notice("default output changed; rebuilding \(self.taps.count) tap(s)")
+        #if DEBUG
+        FileHandle.standardError.write("DEVICE CHANGED — rebuilding \(taps.count) tap(s)\n".data(using: .utf8)!)
+        #endif
+        for (id, tap) in taps {
+            let process = tap.process
+            let gain = tap.gain
+            tap.invalidate()
+            let fresh = ProcessTap(process: process, gain: gain)
+            fresh.activate()
+            taps[id] = fresh
+        }
     }
 
     var processes: [AudioProcess] { controller.processes }
@@ -50,11 +88,19 @@ final class Mixer {
 
     func setLevel(_ value: Float, for process: AudioProcess) {
         let clamped = max(0, min(value, 1.0))
-        levels[process.id] = clamped
+        // 100% is the default, so store nothing for it — otherwise every app
+        // that ever played audio accumulates a redundant entry forever.
+        if clamped >= 1.0 {
+            levels.removeValue(forKey: process.id)
+        } else {
+            levels[process.id] = clamped
+        }
         UserDefaults.standard.set(levels.mapValues { Double($0) }, forKey: Self.levelsKey)
 
         // A tap is only worth its cost while the app is actually attenuated.
         // At 100% we tear it down so the app returns to the untouched hardware path.
+        silentTaps.remove(process.id)
+
         if clamped >= 1.0 {
             if let tap = taps.removeValue(forKey: process.id) {
                 tap.invalidate()
@@ -92,12 +138,40 @@ final class Mixer {
     /// Apps where attenuation had to be abandoned because the tap was silent.
     private(set) var silentTaps: Set<String> = []
 
-    /// Drop taps for processes that have stopped producing audio or exited.
-    func pruneStaleTaps() {
-        let live = Set(controller.processes.map(\.id))
-        for (id, tap) in taps where !live.contains(id) {
+    /// Keep taps in step with what is audible: drop taps whose app is gone,
+    /// and start taps for apps that reappeared with a remembered level below
+    /// 100%. Without the second half, a level restored from UserDefaults did
+    /// nothing until the slider was touched again.
+    func reconcileTaps() {
+        let live = Dictionary(uniqueKeysWithValues: controller.processes.map { ($0.id, $0) })
+
+        for (id, tap) in taps where live[id] == nil {
             tap.invalidate()
             taps.removeValue(forKey: id)
+        }
+
+        // An app whose set of audible process objects changed (a new browser
+        // tab started playing) needs its tap rebuilt, or the new stream is
+        // neither muted nor relayed and escapes the slider entirely.
+        for (id, process) in live {
+            guard let tap = taps[id] else { continue }
+            guard tap.process.objectIDs != process.objectIDs else { continue }
+            let gain = tap.gain
+            tap.invalidate()
+            let fresh = ProcessTap(process: process, gain: gain)
+            fresh.activate()
+            taps[id] = fresh
+        }
+
+        for (id, process) in live {
+            guard taps[id] == nil else { continue }
+            guard !silentTaps.contains(id) else { continue }
+            let stored = levels[id] ?? 1.0
+            guard stored < 1.0 else { continue }
+            let tap = ProcessTap(process: process, gain: stored)
+            tap.activate()
+            taps[id] = tap
+            verifyAudioFlowing(for: process)
         }
     }
 
@@ -110,7 +184,9 @@ final class Mixer {
     /// without a human dragging a slider.
     func debugSelfTest(pid: pid_t) {
         refreshNow()
+        #if DEBUG
         FileHandle.standardError.write("SELFTEST: visible=\(controller.processes.map { "\($0.pid):\($0.name)" })\n".data(using:.utf8)!)
+        #endif
         guard let target = controller.processes.first(where: { $0.pid == pid }) else {
             log.error("selftest: pid \(pid) is not producing audio")
             return
@@ -122,13 +198,24 @@ final class Mixer {
                 return
             }
             let msg = "SELFTEST RESULT callbacks=\(tap.callbackCount) inputPeak=\(tap.inputPeak) error=\(tap.errorMessage ?? "nil")\n"
+            #if DEBUG
             FileHandle.standardError.write(msg.data(using:.utf8)!)
+            #endif
+            log.error("\(msg, privacy: .public)")
         }
     }
 
     func refreshNow() { controller.refresh() }
 
     func shutdown() {
+        if var address = Optional(AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)), let block = deviceListener {
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &address, DispatchQueue.main, block)
+            deviceListener = nil
+        }
         controller.stop()
         taps.values.forEach { $0.invalidate() }
         taps.removeAll()

@@ -135,7 +135,10 @@ final class ProcessTap {
 
         running = true
         errorMessage = nil
-        log.info("tap active for \(self.process.name, privacy: .public) pid \(self.process.pid)")
+        log.notice("tap active for \(self.process.name, privacy: .public) pid \(self.process.pid)")
+        #if DEBUG
+        FileHandle.standardError.write("TAP ACTIVE id=\(process.id) gain=\(gainPointer.pointee)\n".data(using: .utf8)!)
+        #endif
     }
 
     func invalidate() {

@@ -108,7 +108,12 @@ private struct ProcessRow: View {
                     in: 0...1)
             }
 
-            if let error = mixer.error(for: process) {
+            if mixer.silentTaps.contains(process.id) {
+                Text("Can't adjust this app — its audio wasn't readable, so it was left at 100%.")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .lineLimit(3)
+            } else if let error = mixer.error(for: process) {
                 Text(error)
                     .font(.caption2)
                     .foregroundStyle(.red)

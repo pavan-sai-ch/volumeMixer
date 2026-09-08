@@ -30,6 +30,16 @@ struct AudioProcess: Identifiable, Hashable {
         self.objectIDs = objectIDs
     }
 
+    /// Explicit initialiser, so a process can be described without a running
+    /// application behind it — used by the audio test harness.
+    init(id: String, name: String, icon: NSImage?, pid: pid_t, objectIDs: [AudioObjectID]) {
+        self.id = id
+        self.name = name
+        self.icon = icon
+        self.pid = pid
+        self.objectIDs = objectIDs
+    }
+
     static func == (lhs: AudioProcess, rhs: AudioProcess) -> Bool {
         lhs.id == rhs.id && lhs.objectIDs == rhs.objectIDs
     }
