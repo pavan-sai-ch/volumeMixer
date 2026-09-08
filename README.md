@@ -1,74 +1,93 @@
 # volumeMixer
 
-**volumeMixer** is a modern, lightweight macOS utility that brings per-application volume control to your menu bar. Unlike the default system volume, which controls all audio globally, volumeMixer allows you to adjust the gain of individual apps (like Chrome, Spotify, or Zoom) independently.
-
-Built with **SwiftUI** and leveraging the latest **Core Audio Tap (CATap)** APIs introduced in macOS 14.2.
-
----
-
-## ✨ Features
-
-* **Individual Audio Control:** Adjust volume levels for specific apps without affecting system-wide audio.
-* **Menu Bar Resident:** Lives entirely in your menu bar (`LSUIElement`) for a clutter-free workspace.
-* **Automatic Detection:** Dynamically identifies apps currently producing audio using `kAudioHardwarePropertyProcessIsAudible`.
-* **Native Look & Feel:** Displays high-resolution app icons and names for quick identification.
-* **Modern Architecture:** Built using a "Graphify" approach to ensure a clear data flow between Core Audio and the UI.
+**volumeMixer** brings Windows-style per-application volume control to the macOS
+menu bar. macOS exposes a single global output level; volumeMixer lets you set a
+level per app, so you can drop Chrome to 20% while Spotify stays at 100%.
 
 ---
 
-## 🛠 Technical Stack
+## Why this needs a real audio engine
 
-* **Language:** Swift 5.10+
-* **Frameworks:** SwiftUI, CoreAudio, AudioToolbox, AVFoundation
-* **Minimum OS:** macOS 14.2 (Sonoma) or later
-* **API:** `CATap` (Core Audio Tap) for non-destructive audio interception.
+macOS has no per-process volume property — there is nothing to simply *set*.
+Core Audio offers no "set app X to 40%" API. The only route available to a
+normal app is:
 
----
+1. Create a **Core Audio tap** on the target process with mute behavior
+   `.mutedWhenTapped`. While the tap is being read, that process's audio no
+   longer reaches the output hardware.
+2. Receive those samples ourselves, scale them by the chosen gain, and render
+   the result to the output device through a **private aggregate device**.
 
-## 🚀 Getting Started
-
-### Prerequisites
-* **Xcode 15.0+**
-* **macOS 14.2+** (Required for `CATap` support)
-
-### Installation & Building
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/your-username/volumeMixer.git
-    cd volumeMixer
-    ```
-2.  **Open the project:**
-    Open `volumeMixer.xcodeproj` in Xcode.
-3.  **Configure Build Settings:**
-    * Ensure **Code Signing** is configured with your developer team.
-    * Verify the `volumeMixer.entitlements` file is linked in **Build Settings** under **Code Signing Entitlements**.
-    * Ensure the following frameworks are linked in **General > Frameworks, Libraries, and Embedded Content**:
-        * `CoreAudio.framework`
-        * `AudioToolbox.framework`
-        * `AVFoundation.framework`
-4.  **Run:**
-    Press `Cmd + R` to build and run. The app will appear in your top menu bar.
+Net effect: that one app plays at the chosen level; every other app is
+untouched. At 100% the tap is torn down entirely, so the app returns to the
+normal, unmodified hardware path.
 
 ---
 
-## 🔒 Permissions
-This app requires **Microphone/Audio Input** permissions. 
-> **Note:** volumeMixer **does not** record your audio or save any data. This permission is a requirement of the macOS `CATap` API to allow one process to intercept the audio stream of another for the purpose of adjusting gain.
+## Requirements
+
+* macOS **14.2+** (`AudioHardwareCreateProcessTap` is `API_AVAILABLE(macos(14.2))`)
+* Xcode 15+
+* **App Sandbox must stay off.** The sandbox denies Core Audio process taps.
+  `ENABLE_APP_SANDBOX = NO` and the audio-input entitlement are already set in
+  the project.
+
+## Building
+
+```bash
+git clone https://github.com/pavan-sai-ch/volumeMixer.git
+cd volumeMixer
+xcodebuild -scheme volumeMixer -configuration Debug build
+# or just open volumeMixer.xcodeproj and press Cmd+R
+```
+
+The app is an `LSUIElement` agent: it has no Dock icon and no window, only a
+menu bar item.
 
 ---
 
-## 🏗 Architecture
-The project follows a modular "Graphify" pattern:
-* **Models:** `AudioProcess` – Data structure for PIDs and volume states.
-* **Core:** `AudioManager` – The brain of the app. Handles polling for audible processes and managing the lifecycle of Audio Taps.
-* **UI:** `MenuBarView` – A SwiftUI-based reactive interface that binds sliders directly to the audio engine.
+## Architecture
+
+| File | Role |
+|---|---|
+| `AudioProcess.swift` | Value type for one audible process: object ID, PID, bundle ID, display name, icon |
+| `AudioProcessController.swift` | Polls `kAudioHardwarePropertyProcessObjectList` (1s) and keeps the processes where `kAudioProcessPropertyIsRunningOutput == 1` |
+| `ProcessTap.swift` | The engine: tap + private aggregate device + IOProc. Applies gain with `vDSP_vsmul` on the real-time thread |
+| `Mixer.swift` | Owns one `ProcessTap` per attenuated app; persists levels by bundle ID in `UserDefaults` |
+| `MenuBarView.swift` | The menu bar panel — one row per app: icon, name, percentage, mute toggle, slider |
+| `volumeMixerApp.swift` | `MenuBarExtra` entry point |
+
+Levels are keyed by bundle ID so an app keeps its level across relaunches;
+processes with no bundle ID (command-line tools) fall back to a PID key, which
+lasts for the session.
 
 ---
 
-## 🤝 Contributing
-Contributions are welcome! If you have ideas for features (like audio presets or equalizer support), feel free to open an issue or submit a pull request.
+## Permissions
+
+On macOS 26.5 this was measured to need **no TCC prompt**: tap creation and
+sample delivery both succeeded from an unsigned binary with no user approval.
+The project still declares `com.apple.security.device.audio-input` and
+`NSMicrophoneUsageDescription`, because the app genuinely reads other
+processes' audio and the requirement may differ on other macOS versions.
+
+volumeMixer does not record, buffer to disk, or transmit any audio. Samples are
+scaled and passed straight back to the output device.
+
+---
+
+## Known limitations
+
+* **Output device changes are not followed.** The aggregate device is built
+  around whatever the default output was when the tap started. Switching output
+  device while an app is attenuated requires toggling that app back to 100% and
+  down again.
+* **Adds a small amount of latency** for attenuated apps, since their audio
+  takes an extra hop through our render callback. Apps at 100% are unaffected.
+* **No boost above 100%.** The slider is 0–100%; the engine clamps to 1.0.
+* Per-app levels apply to the process, so an app playing several streams has
+  them all scaled together.
 
 ---
 
 ### Created by Pavan
-*Built with the help of AI coding agents and a passion for better macOS workflows.*
